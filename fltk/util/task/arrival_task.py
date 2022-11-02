@@ -33,7 +33,7 @@ class HistoricalArrivalTask(abc.ABC):
     pass
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)
 class ArrivalTask(_ArrivalTask):
     """
     DataClass representation of an ArrivalTask, representing all the information needed to spawn a new learning task.
@@ -49,6 +49,7 @@ class ArrivalTask(_ArrivalTask):
     hyper_parameters: HyperParameters = field(compare=False)
     learning_parameters: LearningParameters = field(compare=False)
     priority: Optional[int] = None
+    time_limit: int = None
 
     @staticmethod
     @abc.abstractmethod
@@ -189,6 +190,14 @@ class ArrivalTask(_ArrivalTask):
         @rtype:
         """
         return getattr(self, parameter)
+
+    def set_epochs(self, epochs: int):
+        """
+        Helper function to set the number of epochs for the experiment.
+        @param epochs: Number of epochs to set.
+        @type epochs: int
+        """
+        self.hyper_parameters.default.total_epochs = epochs
 
 
 @dataclass(order=True, frozen=True)

@@ -5,6 +5,8 @@ import collections
 import logging
 import re
 import time
+from datetime import datetime
+import pytz
 import uuid
 from queue import PriorityQueue
 from typing import OrderedDict, Dict, Type, Set, Union, Optional, List
@@ -148,6 +150,7 @@ class Orchestrator(DistNode, abc.ABC):
         self._cluster_mgr = cluster_mgr
         self._arrival_generator = arv_gen
         self._config = config
+        self._logger.info(f"Running in parallel_execution mode: {self._config.cluster_config.orchestrator.parallel_execution}")
 
         # API to interact with the cluster.
         self._client = PyTorchJobClient()
@@ -264,7 +267,10 @@ class SimulatedOrchestrator(Orchestrator):
             while not self._arrival_generator.arrivals.empty():
                 arrival = self._arrival_generator.arrivals.get()
                 task = _generate_task(arrival)
-                self._logger.debug(f"Arrival of: {task}")
+                current_time = datetime.now(pytz.timezone("Europe/Amsterdam"))
+                self._logger.info("****************** NEW ARRIVAL ******************")
+                self._logger.info(f"Arrival of: {task} at {current_time}")
+                self._logger.info("*************************************************")
                 self.pending_tasks.put(task)
 
             # Deploy all pending tasks without logic
@@ -286,12 +292,15 @@ class SimulatedOrchestrator(Orchestrator):
 
                 # TODO: Extend this logic in your real project, this is only meant for demo purposes
                 # For now we exit the thread after scheduling a single task.
+                if not self._config.cluster_config.orchestrator.parallel_execution:
+                    self.wait_for_jobs_to_complete()
 
             self._logger.info("Still alive...")
             # Prevent high cpu utilization by sleeping between checks.
             time.sleep(self.SLEEP_TIME)
         self.stop()
-        self.wait_for_jobs_to_complete()
+        if self._config.cluster_config.orchestrator.parallel_execution:
+            self.wait_for_jobs_to_complete()
         self._logger.info('Experiment completed.')
 
 
@@ -342,13 +351,14 @@ class BatchOrchestrator(Orchestrator):
         while not self._arrival_generator.arrivals.empty():
             arrival = self._arrival_generator.arrivals.get()
             task = _generate_task(arrival)
-            self._logger.debug(f"Arrival of: {task}")
+            self._logger.debug(f"Arrival of: {task}, priority: {task.priority}")
             self.pending_tasks.put(task)
+
         # 2. Schedule all tasks that arrived previously
         while not self.pending_tasks.empty():
             # Do blocking request to priority queue
             curr_task: ArrivalTask = self.pending_tasks.get()
-            self._logger.info(f"Scheduling arrival of Arrival: {curr_task.id}")
+            self._logger.info(f"Scheduling arrival of Arrival: {curr_task.id}, priority: {curr_task.priority}")
 
             # Create persistent logging information. A these will not be deleted by the Orchestrator, as such
             # allow you to retrieve information of experiments even after removing the PytorchJob after completion.
@@ -364,10 +374,183 @@ class BatchOrchestrator(Orchestrator):
             self.deployed_tasks.add(curr_task)
             # Either wait to complete, or continue. Note that the orchestrator currently does not support scaling
             # experiments up or down.
+
             if not self._config.cluster_config.orchestrator.parallel_execution:
                 self.wait_for_jobs_to_complete()
+            # time.sleep(15)
+
         if self._config.cluster_config.orchestrator.parallel_execution:
             self.wait_for_jobs_to_complete()
         logging.info('Experiment completed.')
         # Stop experiment
         self.stop()
+
+
+class BatchOrchestrator(Orchestrator):
+    """
+    Orchestrator implementation to allow for running all experiments that were defined in one go.
+    """
+
+    def __init__(self, cluster_mgr: ClusterManager, arrival_generator: ArrivalGenerator, config: DistributedConfig):
+        super().__init__(cluster_mgr, arrival_generator, config)
+
+    def run(self, clear: bool = False,
+            experiment_replication: int = 1,
+            wait_historical: bool = True) -> None:
+        """
+        Main loop of the Orchestrator for processing a configuration as a batch, i.e. deploy all-at-once (batch)
+        without any scheduling or simulation applied. This will make use of Kubeflow Training-operators to ensure that
+        pods are created with sufficient resources (depending on resources available on your cluster).
+        @param clear: Boolean indicating whether a previous deployment needs to be cleaned up (i.e. lingering jobs that
+        were deployed by the previous run).
+        @type clear: bool
+        @return: None
+        @rtype: None
+        """
+        self._logger.info(f"Starting experiment Orchestrator: {experiment_replication}")
+        self._alive = True
+        try:
+            if wait_historical:
+                curr_jobs = self._client.get(namespace="test")
+                jobs = [job['metadata']['name'] for job in curr_jobs['items']]
+                self.wait_for_jobs_to_complete(others=jobs)
+            start_time = time.time()
+
+            if clear:
+                self._clear_jobs()
+        except Exception as e:
+            self._logger.warning(f"Failed during house keeping: {e}")
+
+        duration = self._config.get_duration()
+        # In case client does not generate experiment in-time
+
+        # TODO: Add test suite for batch orchestrator
+        while self._arrival_generator.arrivals.qsize() == 0:
+            self._logger.info("Waiting for first arrival!")
+            time.sleep(self.SLEEP_TIME)
+        # 1. Check arrivals
+        # If new arrivals, store them in arrival PriorityQueue
+        while not self._arrival_generator.arrivals.empty():
+            arrival = self._arrival_generator.arrivals.get()
+            task = _generate_task(arrival)
+            self._logger.debug(f"Arrival of: {task}, priority: {task.priority}")
+            self.pending_tasks.put(task)
+
+        # 2. Schedule all tasks that arrived previously
+        i = 1
+        while not self.pending_tasks.empty():
+            # Do blocking request to priority queue
+            curr_task: ArrivalTask = self.pending_tasks.get()
+            self._logger.info(f"Scheduling arrival of Arrival: {curr_task.id}, priority: {curr_task.priority}")
+
+            # Create persistent logging information. A these will not be deleted by the Orchestrator, as such
+            # allow you to retrieve information of experiments even after removing the PytorchJob after completion.
+            config_dict, configmap_name_dict = _prepare_experiment_maps(curr_task,
+                                                                        config=self._config,
+                                                                        u_id=curr_task.id,
+                                                                        replication=experiment_replication)
+            self._create_config_maps(config_dict)
+
+            job_to_start = construct_job(self._config, curr_task, configmap_name_dict)
+            self._logger.info(f"Deploying on cluster: {curr_task.id}")
+            self._client.create(job_to_start, namespace=self._config.cluster_config.namespace)
+            self.deployed_tasks.add(curr_task)
+            # Either wait to complete, or continue. Note that the orchestrator currently does not support scaling
+            # experiments up or down.
+
+            if not self._config.cluster_config.orchestrator.parallel_execution:
+                self.wait_for_jobs_to_complete()
+            i += 1
+            # time.sleep(15)
+
+        if self._config.cluster_config.orchestrator.parallel_execution:
+            self.wait_for_jobs_to_complete()
+        logging.info('Experiment completed.')
+        # Stop experiment
+        self.stop()
+
+class OptimizedSimulatedOrchestrator(Orchestrator):
+    """
+    Orchestrator implementation for Simulated arrivals. Currently, only inter-arrival times following a Poisson process
+    are supported.
+    """
+
+    def __init__(self, cluster_mgr: ClusterManager, arrival_generator: ArrivalGenerator, config: DistributedConfig):
+        super().__init__(cluster_mgr, arrival_generator, config)
+
+    def _optimize_epochs(self, task: ArrivalTask) -> int:
+        """
+        Optimizes the number of epochs to be run for a given task, based on the current state of the cluster.
+        @param task: Task to optimize epochs for.
+        @type task: ArrivalTask
+        @return: Number of epochs to run for this task.
+        @rtype: int
+        """
+        # Values obtained from regression analysis
+        INTERCEPT = -3.1629
+        SLOPE = 27.0135
+        BASE_EPOCHS = 10
+
+        def estimated_time(task1: ArrivalTask) -> float:
+            return INTERCEPT + SLOPE * task1.hyper_parameters.default.total_epochs
+
+        def estimate_epochs(time: float) -> int:
+            return int((time - INTERCEPT) / SLOPE)
+
+        current_queue_time = 0
+        for pending_task in self.pending_tasks.queue:
+            current_queue_time += estimated_time(pending_task)
+
+        allocated_time = self.total_time - current_queue_time
+        task.set_epochs(min(max(estimate_epochs(allocated_time), 1), BASE_EPOCHS))
+        return task
+
+    def run(self, clear: bool = False, experiment_replication: int = -1) -> None:
+        self._alive = True
+        start_time = time.time()
+        if clear:
+            self._clear_jobs()
+        while self._alive and time.time() - start_time < self._config.get_duration():
+            # 1. Check arrivals
+            # If new arrivals, store them in arrival list
+            while not self._arrival_generator.arrivals.empty():
+                arrival = self._arrival_generator.arrivals.get()
+                task = _generate_task(arrival)
+                current_time = datetime.now(pytz.timezone("Europe/Amsterdam"))
+                self._logger.info("****************** NEW ARRIVAL ******************")
+                self._logger.info(f"Arrival of: {task} at {current_time}")
+                self._logger.info("*************************************************")
+
+                task = self._optimize_epochs(task)
+
+                self.pending_tasks.put(task)
+
+            # Deploy all pending tasks without logic
+            while not self.pending_tasks.empty():
+                curr_task: ArrivalTask = self.pending_tasks.get()
+                self._logger.info(f"Scheduling arrival of Arrival: {curr_task.id}")
+                # Create persistent logging information. A these will not be deleted by the Orchestrator, as such, they
+                # allow you to retrieve information of experiments after removing the PytorchJob after completion.
+                config_dict, configmap_name_dict = _prepare_experiment_maps(curr_task,
+                                                                            config=self._config,
+                                                                            u_id=curr_task.id,
+                                                                            replication=experiment_replication)
+                self._create_config_maps(config_dict)
+
+                job_to_start = construct_job(self._config, curr_task, configmap_name_dict)
+                self._logger.info(f"Deploying on cluster: {curr_task.id}")
+                self._client.create(job_to_start, namespace=self._config.cluster_config.namespace)
+                self.deployed_tasks.add(curr_task)
+
+                # TODO: Extend this logic in your real project, this is only meant for demo purposes
+                # For now we exit the thread after scheduling a single task.
+                if not self._config.cluster_config.orchestrator.parallel_execution:
+                    self.wait_for_jobs_to_complete()
+
+            self._logger.info("Still alive...")
+            # Prevent high cpu utilization by sleeping between checks.
+            time.sleep(self.SLEEP_TIME)
+        self.stop()
+        if self._config.cluster_config.orchestrator.parallel_execution:
+            self.wait_for_jobs_to_complete()
+        self._logger.info('Experiment completed.')

@@ -16,7 +16,7 @@ import numpy as np
 
 from fltk.datasets.dataset import Dataset
 from fltk.util.config.definitions.net import Nets
-from fltk.util.config.experiment_config import (HyperParameters, SystemParameters, LearningParameters, JobDescription,
+from fltk.util.config.experiment_config import (HyperParameters, Priority, SystemParameters, LearningParameters, JobDescription,
                                                 ExperimentParser)
 from fltk.util.task.train_task import TrainTask
 
@@ -268,16 +268,19 @@ class SequentialArrivalGenerator(ArrivalGenerator):
             replace_seed = random.randint(0, (2 ** 32) - 2)
             logging.warning(f"Cannot generate repeatable experiments without seed, will set: {replace_seed}")
             seed = replace_seed
+        i = 0
         for job_name, description in self.job_dict.items():
             for repl, job_class_param in enumerate(description.job_class_parameters):
                 replication_name = f"{job_name}_{repl}_{seed}"
+                priority = Priority(i,  1)
+                i += 1
                 train_task = TrainTask(identity=replication_name,
                                        job_parameters=job_class_param,
-                                       priority=None,
+                                       priority=priority,
                                        replication=repl,
                                        experiment_type=description.experiment_type,
                                        seed=seed)
 
                 arrival = Arrival(None, train_task, job_name)
-                self.logger.info(f"(Sequentially) generate experiment: {replication_name}")
+                self.logger.info(f"(Sequentially) generate experiment: {replication_name}, priority: {priority.priority}")
                 self.arrivals.put(arrival)
